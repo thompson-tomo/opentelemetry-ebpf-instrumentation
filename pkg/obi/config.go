@@ -255,8 +255,9 @@ var DefaultConfig = Config{
 		},
 	},
 	Prometheus: prom.PrometheusConfig{
-		Path:    "/metrics",
-		Buckets: export.DefaultBuckets,
+		Path:            "/metrics",
+		Buckets:         export.DefaultBuckets,
+		NativeHistogram: prom.DefaultNativeHistogramConfig,
 		Instrumentations: []instrumentations.Instrumentation{
 			instrumentations.InstrumentationALL,
 		},
