@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/obi/pkg/export/imetrics"
 )
 
 // if a Send operation takes more than this time, we panic informing about a deadlock
@@ -32,6 +34,8 @@ type queueConfig struct {
 	name             string
 	sendTimeout      time.Duration
 	panicOnTimeout   bool
+	// maps any implementation of imetrics.Reporter's QueueBufferUtilization(subscriber string, ratio float64)
+	utilizationGauge func(string, float64)
 }
 
 var defaultQueueConfig = queueConfig{
@@ -40,6 +44,8 @@ var defaultQueueConfig = queueConfig{
 	name:             unnamed,
 	sendTimeout:      defaultSendTimeout,
 	panicOnTimeout:   false,
+	// default to noop
+	utilizationGauge: func(string, float64) {},
 }
 
 // QueueOpts allow configuring some operation of a queue
@@ -87,9 +93,16 @@ func ClosingAttempts(attempts int) QueueOpts {
 	}
 }
 
+func InternalMetrics(p imetrics.Reporter) QueueOpts {
+	return func(c *queueConfig) {
+		c.utilizationGauge = p.QueueBufferUtilization
+	}
+}
+
 type dst[T any] struct {
-	name string
-	ch   chan T
+	name  string
+	ch    chan T
+	gauge func(string, float64)
 }
 
 // sink holds the mutable, shared delivery state of a group of queues connected through Bypass.
@@ -142,6 +155,11 @@ func NewQueue[T any](opts ...QueueOpts) *Queue[T] {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	// if channel capacity is set to zero, disable capacity ratio metrics to avoid divisions by zero
+	if cfg.channelBufferLen <= 0 {
+		cfg.utilizationGauge = func(string, float64) {}
+	}
+
 	q := &Queue[T]{
 		cfg:              &cfg,
 		routeNames:       []string{cfg.name},
@@ -205,6 +223,8 @@ func (s *sink[T]) send(ctx context.Context, o T, route []string) {
 	}
 	var blocked []dst[T]
 	for _, d := range dsts {
+		// report channel len/capacity ratio metrics
+		d.gauge(d.name, float64(len(d.ch)+1)/float64(cap(d.ch)))
 		select {
 		case <-ctx.Done():
 			return
@@ -290,7 +310,11 @@ func (q *Queue[T]) Subscribe(options ...SubscribeOpt) <-chan T {
 	s.mt.Lock()
 	defer s.mt.Unlock()
 	ch := make(chan T, s.cfg.channelBufferLen)
-	s.dsts = append(s.dsts, dst[T]{ch: ch, name: opts.subscriber})
+	s.dsts = append(s.dsts, dst[T]{
+		ch:    ch,
+		name:  opts.subscriber,
+		gauge: s.cfg.utilizationGauge,
+	})
 	return ch
 }
 
@@ -323,16 +347,17 @@ func (q *Queue[T]) Bypass(to *Queue[T]) {
 	dstSink.mt.Lock()
 	defer dstSink.mt.Unlock()
 
-	// move all the subscribers of the source group into the destination group
-	dstSink.dsts = append(dstSink.dsts, srcSink.dsts...)
-	srcSink.dsts = nil
-
 	// re-point every queue of the source group to the destination sink, so future Sends and
 	// Subscribes reach the destination directly, and extend their diagnostic route with to's route
 	for _, m := range srcSink.members {
 		m.sink = dstSink
 		m.routeNames = append(m.routeNames, to.routeNames...)
 	}
+
+	// move all the subscribers of the source group into the destination group
+	dstSink.dsts = append(dstSink.dsts, srcSink.dsts...)
+	srcSink.dsts = nil
+
 	dstSink.members = append(dstSink.members, srcSink.members...)
 	srcSink.members = nil
 
