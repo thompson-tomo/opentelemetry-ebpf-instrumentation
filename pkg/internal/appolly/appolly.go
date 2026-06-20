@@ -97,6 +97,7 @@ func New(ctx context.Context, ctxInfo *global.ContextInfo, config *obi.Config) (
 	), swarm.WithID("DockerProcessEventDecorator"))
 
 	runtimeMetrics := newRuntimeMetricsQueue(config)
+	ebpfEventContext := ebpfcommon.NewEBPFEventContext()
 
 	bp, err := appolly.Build(ctx, config, ctxInfo, tracesInput, processEventsDockerDecorated, runtimeMetrics)
 	if err != nil {
@@ -113,7 +114,7 @@ func New(ctx context.Context, ctxInfo *global.ContextInfo, config *obi.Config) (
 		processEventInput:  processEventsInput,
 		bp:                 bp,
 		peGraphBuilder:     swi,
-		ebpfEventContext:   ebpfcommon.NewEBPFEventContext(),
+		ebpfEventContext:   ebpfEventContext,
 		runtimeMetrics:     runtimeMetrics,
 		dynamicPIDSelector: sel,
 	}
@@ -122,8 +123,9 @@ func New(ctx context.Context, ctxInfo *global.ContextInfo, config *obi.Config) (
 
 func newRuntimeMetricsQueue(config *obi.Config) *msg.Queue[[]runtimemetrics.RuntimeMetricSnapshot] {
 	jointMetricsConfig := appolly.JoinMetricsConfig(config)
+	runtimeMetricsEnabled := runtimemetrics.EnabledFeatures(jointMetricsConfig.Features)
 
-	if !jointMetricsConfig.Features.AppRuntime() ||
+	if !runtimeMetricsEnabled.Any() ||
 		!jointMetricsConfig.Features.AnyAppO11yMetric() ||
 		(!config.OTELMetrics.EndpointEnabled() && !config.Prometheus.EndpointEnabled()) {
 		return nil
