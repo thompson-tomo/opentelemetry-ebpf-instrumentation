@@ -4,6 +4,7 @@
 package convert // import "go.opentelemetry.io/obi/internal/config/convert"
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -37,6 +38,12 @@ func V2ToRuntime(src *schema.Extension) (*obi.Config, error) {
 		return nil, err
 	}
 	if err := validateV2RulePatterns(src.Capture.Rules); err != nil {
+		return nil, err
+	}
+	if err := validateV2HTTPFilters(src.Capture.Instrumentation.HTTP.Filters); err != nil {
+		return nil, err
+	}
+	if err := validateV2HTTPPayloadExtraction(src.Capture.Instrumentation.HTTP.PayloadExtraction); err != nil {
 		return nil, err
 	}
 
@@ -185,6 +192,52 @@ func validateV2RulePatterns(rules []schema.Rule) error {
 		}
 	}
 	return nil
+}
+
+func validateV2HTTPFilters(filters schema.SignalFilters) error {
+	if len(filters.Traces) == 0 || len(filters.Metrics) == 0 {
+		return nil
+	}
+	if reflect.DeepEqual(filters.Traces, filters.Metrics) {
+		return nil
+	}
+	return errors.New("capture.instrumentation.http.filters: trace and metric filters cannot differ")
+}
+
+func validateV2HTTPPayloadExtraction(payload schema.PayloadExtraction) error {
+	for i, extractor := range payload.Enabled {
+		if !validV2HTTPPayloadExtractor(extractor) {
+			return fmt.Errorf(
+				"capture.instrumentation.http.payload_extraction.enabled[%d]: unknown payload extractor %q",
+				i,
+				extractor,
+			)
+		}
+	}
+	return nil
+}
+
+func validV2HTTPPayloadExtractor(extractor string) bool {
+	switch extractor {
+	case payloadExtractorGraphQL,
+		payloadExtractorElasticsearch,
+		payloadExtractorAWS,
+		payloadExtractorSQLPP,
+		payloadExtractorOpenAI,
+		payloadExtractorAnthropic,
+		payloadExtractorGemini,
+		payloadExtractorQwen,
+		payloadExtractorBedrock,
+		payloadExtractorMCP,
+		payloadExtractorEmbedding,
+		payloadExtractorRerank,
+		payloadExtractorRetrieval,
+		payloadExtractorJSONRPC,
+		payloadExtractorEnrichment:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateV2RuleProcessGlobPatterns(path string, match schema.RuleProcessMatch) error {
@@ -623,9 +676,7 @@ func applyV2Instrumentation(cfg *obi.Config, instrumentation schema.Instrumentat
 }
 
 func applyFullV2Instrumentation(cfg *obi.Config, instrumentation schema.Instrumentation) {
-	cfg.EBPF.TrackRequestHeaders = instrumentation.HTTP.TrackRequestHeaders
-	cfg.EBPF.HTTPRequestTimeout = instrumentation.HTTP.RequestTimeout.TimeDuration()
-	cfg.EBPF.BufferSizes.HTTP = instrumentation.HTTP.BufferSize
+	applyFullV2HTTPInstrumentation(cfg, instrumentation.HTTP)
 
 	cfg.EBPF.HeuristicSQLDetect = instrumentation.SQL.HeuristicDetect
 	cfg.EBPF.BufferSizes.MySQL = instrumentation.SQL.MySQL.BufferSize
@@ -649,15 +700,7 @@ func applyFullV2Instrumentation(cfg *obi.Config, instrumentation schema.Instrume
 
 func applyPartialV2Instrumentation(cfg *obi.Config, instrumentation schema.Instrumentation) {
 	if !zeroValue(instrumentation.HTTP) {
-		if instrumentation.HTTP.TrackRequestHeaders {
-			cfg.EBPF.TrackRequestHeaders = true
-		}
-		if !zeroValue(instrumentation.HTTP.RequestTimeout) {
-			cfg.EBPF.HTTPRequestTimeout = instrumentation.HTTP.RequestTimeout.TimeDuration()
-		}
-		if instrumentation.HTTP.BufferSize != 0 {
-			cfg.EBPF.BufferSizes.HTTP = instrumentation.HTTP.BufferSize
-		}
+		applyPartialV2HTTPInstrumentation(cfg, instrumentation.HTTP)
 	}
 
 	if !zeroValue(instrumentation.SQL) {
@@ -710,6 +753,214 @@ func applyPartialV2Instrumentation(cfg *obi.Config, instrumentation schema.Instr
 	}
 	if !zeroValue(instrumentation.GPU.EnabledMode) {
 		cfg.EBPF.InstrumentCuda = instrumentation.GPU.EnabledMode
+	}
+}
+
+func applyFullV2HTTPInstrumentation(cfg *obi.Config, http schema.HTTPInstrumentation) {
+	cfg.EBPF.TrackRequestHeaders = http.TrackRequestHeaders
+	cfg.EBPF.HTTPRequestTimeout = http.RequestTimeout.TimeDuration()
+	cfg.EBPF.BufferSizes.HTTP = http.BufferSize
+
+	applyV2HTTPFilters(cfg, http.Filters, true)
+	applyFullV2HTTPRoutes(cfg, http.Routes)
+	applyFullV2HTTPPayloadExtraction(cfg, http.PayloadExtraction)
+}
+
+func applyPartialV2HTTPInstrumentation(cfg *obi.Config, http schema.HTTPInstrumentation) {
+	if http.TrackRequestHeaders {
+		cfg.EBPF.TrackRequestHeaders = true
+	}
+	if !zeroValue(http.RequestTimeout) {
+		cfg.EBPF.HTTPRequestTimeout = http.RequestTimeout.TimeDuration()
+	}
+	if http.BufferSize != 0 {
+		cfg.EBPF.BufferSizes.HTTP = http.BufferSize
+	}
+	applyV2HTTPFilters(cfg, http.Filters, false)
+	applyPartialV2HTTPRoutes(cfg, http.Routes)
+	applyPartialV2HTTPPayloadExtraction(cfg, http.PayloadExtraction)
+}
+
+func applyV2HTTPFilters(cfg *obi.Config, filters schema.SignalFilters, complete bool) {
+	if zeroValue(filters) && !complete {
+		return
+	}
+	cfg.Filters.Application = attributeFilterMap(v2HTTPFilterMap(filters))
+}
+
+func v2HTTPFilterMap(filters schema.SignalFilters) schema.AttributeFilters {
+	if len(filters.Traces) != 0 {
+		return filters.Traces
+	}
+	return filters.Metrics
+}
+
+func applyFullV2HTTPRoutes(cfg *obi.Config, routes schema.HTTPRoutes) {
+	applyV2HTTPRouteDiscovery(cfg, routes.Discovery, true)
+	if !hasV2HTTPRouteConfig(routes) {
+		cfg.Routes = nil
+		return
+	}
+
+	cfg.Routes = &transform.RoutesConfig{}
+	applyV2HTTPRouteConfig(cfg.Routes, routes)
+}
+
+func applyPartialV2HTTPRoutes(cfg *obi.Config, routes schema.HTTPRoutes) {
+	if zeroValue(routes) {
+		return
+	}
+	applyV2HTTPRouteDiscovery(cfg, routes.Discovery, false)
+	if !hasV2HTTPRouteConfig(routes) {
+		return
+	}
+	if cfg.Routes == nil {
+		cfg.Routes = &transform.RoutesConfig{}
+	}
+	applyV2HTTPRouteConfig(cfg.Routes, routes)
+}
+
+func applyV2HTTPRouteDiscovery(cfg *obi.Config, discovery schema.HTTPRouteDiscovery, complete bool) {
+	if zeroValue(discovery) && !complete {
+		return
+	}
+	if complete || !zeroValue(discovery.Timeout) {
+		cfg.Discovery.RouteHarvesterTimeout = discovery.Timeout.TimeDuration()
+	}
+	if complete || discovery.DisabledLanguages != nil {
+		cfg.Discovery.DisabledRouteHarvesters = cloneRouteHarvesterLanguages(discovery.DisabledLanguages)
+	}
+	if complete || !zeroValue(discovery.Java.Delay) {
+		cfg.Discovery.RouteHarvestConfig.JavaHarvestDelay = discovery.Java.Delay.TimeDuration()
+	}
+}
+
+func hasV2HTTPRouteConfig(routes schema.HTTPRoutes) bool {
+	return routes.Unmatched != nil ||
+		routes.Patterns != nil ||
+		routes.IgnoredPatterns != nil ||
+		routes.IgnoreMode != nil ||
+		routes.WildcardChar != nil ||
+		routes.MaxPathSegmentCardinality != nil
+}
+
+func applyV2HTTPRouteConfig(dst *transform.RoutesConfig, routes schema.HTTPRoutes) {
+	if routes.Unmatched != nil {
+		dst.Unmatch = *routes.Unmatched
+	}
+	if routes.Patterns != nil {
+		dst.Patterns = cloneStrings(*routes.Patterns)
+	}
+	if routes.IgnoredPatterns != nil {
+		dst.IgnorePatterns = cloneStrings(*routes.IgnoredPatterns)
+	}
+	if routes.IgnoreMode != nil {
+		dst.IgnoredEvents = *routes.IgnoreMode
+	}
+	if routes.WildcardChar != nil {
+		dst.WildcardChar = *routes.WildcardChar
+	}
+	if routes.MaxPathSegmentCardinality != nil {
+		dst.MaxPathSegmentCardinality = *routes.MaxPathSegmentCardinality
+	}
+}
+
+func applyFullV2HTTPPayloadExtraction(cfg *obi.Config, payload schema.PayloadExtraction) {
+	http := &cfg.EBPF.PayloadExtraction.HTTP
+	applyV2HTTPPayloadExtractorMembership(http, payload.Enabled)
+	http.SQLPP.EndpointPatterns = cloneStrings(payload.SQLPP.EndpointPatterns)
+	applyFullV2HTTPEnrichment(http, payload.Enrichment)
+}
+
+func applyPartialV2HTTPPayloadExtraction(cfg *obi.Config, payload schema.PayloadExtraction) {
+	if zeroValue(payload) {
+		return
+	}
+
+	http := &cfg.EBPF.PayloadExtraction.HTTP
+	if payload.Enabled != nil {
+		applyV2HTTPPayloadExtractorMembership(http, payload.Enabled)
+	}
+	if payload.SQLPP.EndpointPatterns != nil {
+		http.SQLPP.EndpointPatterns = cloneStrings(payload.SQLPP.EndpointPatterns)
+	}
+	if !zeroValue(payload.Enrichment) {
+		applyPartialV2HTTPEnrichment(http, payload.Enrichment)
+	}
+}
+
+func applyV2HTTPPayloadExtractorMembership(http *obiconfig.HTTPConfig, enabled []string) {
+	http.GraphQL.Enabled = false
+	http.Elasticsearch.Enabled = false
+	http.AWS.Enabled = false
+	http.SQLPP.Enabled = false
+	http.GenAI.OpenAI.Enabled = false
+	http.GenAI.Anthropic.Enabled = false
+	http.GenAI.Gemini.Enabled = false
+	http.GenAI.Qwen.Enabled = false
+	http.GenAI.Bedrock.Enabled = false
+	http.GenAI.MCP.Enabled = false
+	http.GenAI.Embedding.Enabled = false
+	http.GenAI.Rerank.Enabled = false
+	http.GenAI.Retrieval.Enabled = false
+	http.JSONRPC.Enabled = false
+	http.Enrichment.Enabled = false
+
+	for _, extractor := range enabled {
+		switch extractor {
+		case payloadExtractorGraphQL:
+			http.GraphQL.Enabled = true
+		case payloadExtractorElasticsearch:
+			http.Elasticsearch.Enabled = true
+		case payloadExtractorAWS:
+			http.AWS.Enabled = true
+		case payloadExtractorSQLPP:
+			http.SQLPP.Enabled = true
+		case payloadExtractorOpenAI:
+			http.GenAI.OpenAI.Enabled = true
+		case payloadExtractorAnthropic:
+			http.GenAI.Anthropic.Enabled = true
+		case payloadExtractorGemini:
+			http.GenAI.Gemini.Enabled = true
+		case payloadExtractorQwen:
+			http.GenAI.Qwen.Enabled = true
+		case payloadExtractorBedrock:
+			http.GenAI.Bedrock.Enabled = true
+		case payloadExtractorMCP:
+			http.GenAI.MCP.Enabled = true
+		case payloadExtractorEmbedding:
+			http.GenAI.Embedding.Enabled = true
+		case payloadExtractorRerank:
+			http.GenAI.Rerank.Enabled = true
+		case payloadExtractorRetrieval:
+			http.GenAI.Retrieval.Enabled = true
+		case payloadExtractorJSONRPC:
+			http.JSONRPC.Enabled = true
+		case payloadExtractorEnrichment:
+			http.Enrichment.Enabled = true
+		}
+	}
+}
+
+func applyFullV2HTTPEnrichment(http *obiconfig.HTTPConfig, enrichment schema.HTTPEnrichment) {
+	http.Enrichment.Policy.DefaultAction.Headers = enrichment.Policy.DefaultAction.Headers
+	http.Enrichment.Policy.DefaultAction.Body = enrichment.Policy.DefaultAction.Body
+	http.Enrichment.Policy.ObfuscationString = enrichment.Policy.ObfuscationString
+	http.Enrichment.Rules = cloneHTTPParsingRules(enrichment.Rules)
+}
+
+func applyPartialV2HTTPEnrichment(http *obiconfig.HTTPConfig, enrichment schema.HTTPEnrichment) {
+	if !zeroValue(enrichment.Policy.DefaultAction.Headers) {
+		http.Enrichment.Policy.DefaultAction.Headers = enrichment.Policy.DefaultAction.Headers
+	}
+	if !zeroValue(enrichment.Policy.DefaultAction.Body) {
+		http.Enrichment.Policy.DefaultAction.Body = enrichment.Policy.DefaultAction.Body
+	}
+	if enrichment.Policy.ObfuscationString != "" {
+		http.Enrichment.Policy.ObfuscationString = enrichment.Policy.ObfuscationString
+	}
+	if enrichment.Rules != nil {
+		http.Enrichment.Rules = cloneHTTPParsingRules(enrichment.Rules)
 	}
 }
 
@@ -1435,6 +1686,20 @@ func cloneStrings(values []string) []string {
 		return nil
 	}
 	return append([]string(nil), values...)
+}
+
+func cloneRouteHarvesterLanguages(values []services.RouteHarvesterLanguage) []services.RouteHarvesterLanguage {
+	if values == nil {
+		return nil
+	}
+	return append([]services.RouteHarvesterLanguage(nil), values...)
+}
+
+func cloneHTTPParsingRules(values []obiconfig.HTTPParsingRule) []obiconfig.HTTPParsingRule {
+	if values == nil {
+		return nil
+	}
+	return append([]obiconfig.HTTPParsingRule(nil), values...)
 }
 
 type runtimeCIDRDefinition interface {
