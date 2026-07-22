@@ -1005,6 +1005,9 @@ func TestSuite_LogEnricherGoGRPC(t *testing.T) {
 	t.Run("Log Enricher Go writev clamp", func(t *testing.T) {
 		testLogEnricherWritevClamp(t, logEnricherGoWritevRegressionConstants)
 	})
+	t.Run("Log Enricher plain text", func(t *testing.T) {
+		testLogEnricherPlainText(t, logEnricherGoGRPCConstants)
+	})
 	require.NoError(t, compose.Close())
 }
 
