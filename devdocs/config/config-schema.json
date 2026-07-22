@@ -967,6 +967,10 @@
           "$ref": "#/$defs/MCPConfig",
           "description": "Model Context Protocol (MCP) payload extraction and parsing"
         },
+        "ollama": {
+          "$ref": "#/$defs/OllamaConfig",
+          "description": "Native API payload extraction and parsing"
+        },
         "openai": {
           "$ref": "#/$defs/OpenAIConfig",
           "description": "Payload extraction and parsing"
@@ -2170,6 +2174,17 @@
       },
       "type": "object",
       "description": "NumericRange defines numeric comparison criteria for a rule match condition. All fields are optional; only the provided fields are evaluated."
+    },
+    "OllamaConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable Ollama native API payload extraction and parsing",
+          "default": false,
+          "x-env-var": "OTEL_EBPF_HTTP_OLLAMA_ENABLED"
+        }
+      },
+      "type": "object"
     },
     "OpenAICompatibleConfig": {
       "properties": {
